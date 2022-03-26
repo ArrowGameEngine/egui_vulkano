@@ -25,7 +25,3 @@ winit = "0.26.0"
 vulkano-win = "0.28.0"
 egui-winit = "0.17.0"
 egui_demo_lib = "0.17.0"
-
-[[bin]]
-name = "example"
-path = "examples/example.rs"
