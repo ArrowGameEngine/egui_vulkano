@@ -2,17 +2,14 @@
 /// Differences:
 /// * Set the correct color format for the swapchain
 /// * Second renderpass to draw the gui
-use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::sync::Arc;
 use std::time::Instant;
 
-use egui::plot::{HLine, Line, Plot, Value, Values};
-use egui::{Color32, ColorImage, Ui};
 use egui_vulkano::UpdateTexturesResult;
 use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer, TypedBufferAccess};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, SubpassContents};
-use vulkano::device::physical::PhysicalDevice;
+use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{Device, DeviceExtensions};
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
@@ -24,52 +21,69 @@ use vulkano::pipeline::graphics::viewport::Viewport;
 use vulkano::pipeline::graphics::viewport::ViewportState;
 use vulkano::pipeline::GraphicsPipeline;
 use vulkano::render_pass::{Framebuffer, RenderPass, Subpass};
-use vulkano::swapchain::{AcquireError, ColorSpace, Swapchain, SwapchainCreationError};
-use vulkano::sync::{FenceSignalFuture, FlushError, GpuFuture};
-use vulkano::{swapchain, sync, Version};
+use vulkano::swapchain::{AcquireError, ColorSpace, Swapchain, PresentMode, SwapchainCreationError};
+use vulkano::sync::{GpuFuture, FlushError};
+use vulkano::{swapchain, Version};
 use vulkano_win::VkSurfaceBuild;
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Fullscreen, Window, WindowBuilder};
 
-pub enum FrameEndFuture<F: GpuFuture + 'static> {
-    FenceSignalFuture(FenceSignalFuture<F>),
-    BoxedFuture(Box<dyn GpuFuture>),
+mod future;
+use future::FrameEndFuture;
+
+mod benchmark_widget;
+use benchmark_widget::Benchmark;
+
+
+
+#[derive(Default, Debug, Clone)]
+struct Vertex {
+    position: [f32; 2],
+}
+vulkano::impl_vertex!(Vertex, position);
+
+mod vs {
+    vulkano_shaders::shader! {
+        ty: "vertex",
+        src: "
+            #version 450
+
+            layout(location = 0) in vec2 position;
+
+            void main() {
+                gl_Position = vec4(position, 0.0, 1.0);
+            }
+        "
+    }
 }
 
-impl<F: GpuFuture> FrameEndFuture<F> {
-    pub fn now(device: Arc<Device>) -> Self {
-        Self::BoxedFuture(sync::now(device).boxed())
-    }
+mod fs {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        src: "
+            #version 450
 
-    pub fn get(self) -> Box<dyn GpuFuture> {
-        match self {
-            FrameEndFuture::FenceSignalFuture(f) => f.boxed(),
-            FrameEndFuture::BoxedFuture(f) => f,
-        }
+            layout(location = 0) out vec4 f_color;
+
+            void main() {
+                f_color = vec4(1.0, 0.0, 0.0, 1.0);
+            }
+        "
     }
 }
 
-impl<F: GpuFuture> AsMut<dyn GpuFuture> for FrameEndFuture<F> {
-    fn as_mut(&mut self) -> &mut (dyn GpuFuture + 'static) {
-        match self {
-            FrameEndFuture::FenceSignalFuture(f) => f,
-            FrameEndFuture::BoxedFuture(f) => f,
-        }
-    }
-}
+
 
 fn main() {
     let required_extensions = vulkano_win::required_extensions();
+    let device_extensions = DeviceExtensions {
+        khr_swapchain: true,
+        nv_shading_rate_image: true,
+        ..DeviceExtensions::none()
+    };
 
-    let instance = Instance::new(None, Version::V1_0, &required_extensions, None).unwrap();
-    let physical = PhysicalDevice::enumerate(&instance).next().unwrap();
-
-    println!(
-        "Using device: {} (type: {:?})",
-        physical.properties().device_name,
-        physical.properties().device_type,
-    );
+    let instance = Instance::new(None, Version::V1_1, &required_extensions, None).unwrap();
 
     let event_loop = EventLoop::new();
     let surface = WindowBuilder::new()
@@ -78,19 +92,35 @@ fn main() {
         .build_vk_surface(&event_loop, instance.clone())
         .unwrap();
 
-    let queue_family = physical
-        .queue_families()
-        .find(|&q| q.supports_graphics() && surface.is_supported(q).unwrap_or(false))
-        .unwrap();
+    let (physical, queue_family) = PhysicalDevice::enumerate(&instance)
+        .filter(|&p| p.supported_extensions().is_superset_of(&device_extensions) )
+        .filter_map(|p| p.queue_families()
+                            .find(|&q| q.supports_graphics() && surface.is_supported(q).unwrap_or(false) )
+                            .map(|q| (p, q))
+        )
+        .min_by_key(|(p, _)| match p.properties().device_type {
+                                        PhysicalDeviceType::DiscreteGpu => 0,
+                                        PhysicalDeviceType::IntegratedGpu => 1,
+                                        PhysicalDeviceType::VirtualGpu => 2,
+                                        PhysicalDeviceType::Cpu => 3,
+                                        PhysicalDeviceType::Other => 4,
+                                    }
+        ).unwrap();
 
-    let device_ext = DeviceExtensions {
-        khr_swapchain: true,
-        ..DeviceExtensions::none()
-    };
+    println!(
+        "Using device: {} (type: {:?})",
+        physical.properties().device_name,
+        physical.properties().device_type
+    );
+
+    // Solving conflict between attachment_variable_shading_rate and shading_rate_image
+    let mut features = physical.supported_features().clone();
+    features.shading_rate_image = false;
+
     let (device, mut queues) = Device::new(
-        physical,
-        physical.supported_features(),
-        &physical.required_extensions().union(&device_ext),
+        physical, 
+        &features,                
+        &physical.required_extensions().union(&device_extensions),
         [(queue_family, 0.5)].iter().cloned(),
     )
     .unwrap();
@@ -102,11 +132,22 @@ fn main() {
         let alpha = caps.supported_composite_alpha.iter().next().unwrap();
 
         // Set the swapchain format to Srgb to get correct colors for egui
-        assert!(&caps
-            .supported_formats
-            .contains(&(Format::B8G8R8A8_SRGB, ColorSpace::SrgbNonLinear)));
+        assert!(&caps.supported_formats
+                     .contains(&(Format::B8G8R8A8_SRGB, ColorSpace::SrgbNonLinear)));
         let format = Format::B8G8R8A8_SRGB;
         let dimensions: [u32; 2] = surface.window().inner_size().into();
+
+        // Select best present mode (optimization)
+        let present_mode = if caps.present_modes.mailbox {
+            println!("Swapchain mode: Mailbox");
+            PresentMode::Mailbox
+        } else if caps.present_modes.immediate {
+            println!("Swapchain mode: Immediate");
+            PresentMode::Immediate
+        } else {
+            println!("Swapchain mode: Fifo");
+            PresentMode::Fifo
+        };
 
         Swapchain::start(device.clone(), surface.clone())
             .num_images(caps.min_image_count)
@@ -115,15 +156,10 @@ fn main() {
             .usage(ImageUsage::color_attachment())
             .sharing_mode(&queue)
             .composite_alpha(alpha)
+            .present_mode(present_mode)
             .build()
             .unwrap()
     };
-
-    #[derive(Default, Debug, Clone)]
-    struct Vertex {
-        position: [f32; 2],
-    }
-    vulkano::impl_vertex!(Vertex, position);
 
     let vertex_buffer = {
         CpuAccessibleBuffer::from_iter(
@@ -146,36 +182,6 @@ fn main() {
         )
         .unwrap()
     };
-
-    mod vs {
-        vulkano_shaders::shader! {
-            ty: "vertex",
-            src: "
-				#version 450
-
-				layout(location = 0) in vec2 position;
-
-				void main() {
-					gl_Position = vec4(position, 0.0, 1.0);
-				}
-			"
-        }
-    }
-
-    mod fs {
-        vulkano_shaders::shader! {
-            ty: "fragment",
-            src: "
-				#version 450
-
-				layout(location = 0) out vec4 f_color;
-
-				void main() {
-					f_color = vec4(1.0, 0.0, 0.0, 1.0);
-				}
-			"
-        }
-    }
 
     let vs = vs::load(device.clone()).unwrap();
     let fs = fs::load(device.clone()).unwrap();
@@ -236,7 +242,7 @@ fn main() {
     let mut egui_test = egui_demo_lib::ColorTest::default();
     let mut demo_windows = egui_demo_lib::DemoWindows::default();
     let mut egui_bench = Benchmark::new(1000);
-    let mut my_texture = egui_ctx.load_texture("my_texture", ColorImage::example());
+    let mut my_texture = egui_ctx.load_texture("my_texture", egui::ColorImage::example());
 
     event_loop.run(move |event, _, control_flow| {
         match event {
@@ -330,7 +336,7 @@ fn main() {
                     ui.image(my_texture.id(), (200.0, 200.0));
                     if ui.button("Reload texture").clicked() {
                         // previous TextureHandle is dropped, causing egui to free the texture:
-                        my_texture = egui_ctx.load_texture("my_texture", ColorImage::example());
+                        my_texture = egui_ctx.load_texture("my_texture", egui::ColorImage::example());
                     }
                 });
 
@@ -435,45 +441,4 @@ fn window_size_dependent_setup(
         })
         .collect::<Vec<_>>();
     framebuffers
-}
-
-pub struct Benchmark {
-    capacity: usize,
-    data: VecDeque<f64>,
-}
-
-impl Benchmark {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            data: VecDeque::with_capacity(capacity),
-        }
-    }
-
-    pub fn draw(&self, ui: &mut Ui) {
-        let iter = self
-            .data
-            .iter()
-            .enumerate()
-            .map(|(i, v)| Value::new(i as f64, *v * 1000.0));
-        let curve = Line::new(Values::from_values_iter(iter)).color(Color32::BLUE);
-        let target = HLine::new(1000.0 / 60.0).color(Color32::RED);
-
-        ui.label("Time in milliseconds that the gui took to draw:");
-        Plot::new("plot")
-            .view_aspect(2.0)
-            .include_y(0)
-            .show(ui, |plot_ui| {
-                plot_ui.line(curve);
-                plot_ui.hline(target)
-            });
-        ui.label("The red line marks the frametime target for drawing at 60 FPS.");
-    }
-
-    pub fn push(&mut self, v: f64) {
-        if self.data.len() >= self.capacity {
-            self.data.pop_front();
-        }
-        self.data.push_back(v);
-    }
 }

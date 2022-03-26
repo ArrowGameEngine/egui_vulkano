@@ -15,9 +15,17 @@ vulkano = "0.28.0"
 vulkano-shaders = "0.28.0"
 egui = "0.17.0"
 thiserror = "1.0"
+winit = "0.26.0"
+vulkano-win = "0.28.0"
+egui-winit = "0.17.0"
+egui_demo_lib = "0.17.0"
 
 [dev-dependencies]
 winit = "0.26.0"
 vulkano-win = "0.28.0"
 egui-winit = "0.17.0"
 egui_demo_lib = "0.17.0"
+
+[[bin]]
+name = "example"
+path = "examples/example.rs"
